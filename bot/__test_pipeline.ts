@@ -7,7 +7,7 @@ import 'dotenv/config'
 import { parseExpense } from './parserAI'
 import { routeIntent } from './intentRouter'
 import { generateReply } from './chatLLM'
-import { MemberInfo } from './types'
+import { MemberInfo, Intent, EngineResult } from './types'
 
 const FAKE_MEMBERS: MemberInfo[] = [
   { telegram_user_id: 111111111, display_name: 'Raj', telegram_username: 'raj_test' },
@@ -19,6 +19,12 @@ const TESTS = [
   {
     label: 'Expense message',
     message: 'paid 1200 for hotel',
+    senderName: 'Raj',
+    senderId: 111111111,
+  },
+  {
+    label: 'Transfer message',
+    message: 'received 500 from Priya',
     senderName: 'Raj',
     senderId: 111111111,
   },
@@ -48,44 +54,52 @@ async function runTest(t: typeof TESTS[0]) {
   console.log(`Message: "${t.message}"`)
   console.log('='.repeat(60))
 
-  // Layer 1: Parser
-  console.log('\n--- Parser ---')
-  let parsed
-  try {
-    parsed = await parseExpense(t.message, t.senderName, t.senderId, FAKE_MEMBERS)
-    console.log('parsed:', parsed)
-  } catch (e) {
-    console.error('Parser threw:', e)
-    parsed = null
-  }
-
-  // Layer 2: Intent Router
+  // Layer 2 runs FIRST per spec
   console.log('\n--- Intent Router ---')
-  let intents
+  let intents: Intent[] = []
   try {
     intents = await routeIntent(t.message, t.senderName, FAKE_MEMBERS)
     console.log('intents:', intents)
   } catch (e) {
     console.error('IntentRouter threw:', e)
-    intents = []
   }
 
-  // Layer 3: Chat LLM (only if we'd have results)
-  const engineResults = []
-  if (parsed) {
+  const isTransfer = intents.some(i => i.type === 'RECORD_TRANSFER')
+  const isExpense = intents.some(i => i.type === 'RECORD_EXPENSE')
+
+  // Layer 1: Parser — only for expenses, never for transfers
+  console.log('\n--- Parser ---')
+  const engineResults: EngineResult[] = []
+
+  if (isExpense && !isTransfer) {
+    try {
+      const parsed = await parseExpense(t.message, t.senderName, t.senderId, FAKE_MEMBERS)
+      console.log('parsed:', parsed)
+      if (parsed) {
+        engineResults.push({
+          type: 'RECORD_EXPENSE',
+          data: parsed,
+          summary: `Logged: Rs.${parsed.amount} for "${parsed.description}"`
+        })
+      }
+    } catch (e) {
+      console.error('Parser threw:', e)
+    }
+  } else {
+    console.log('(skipped — not an expense intent or is a transfer)')
+  }
+
+  // Simulate actionable intents (without real engines)
+  const actionable = intents.filter(i => i.type !== 'RECORD_EXPENSE' && i.type !== 'UNKNOWN')
+  for (const intent of actionable) {
     engineResults.push({
-      type: 'RECORD_EXPENSE',
-      data: parsed,
-      summary: `Logged: Rs.${parsed.amount} for "${parsed.description}"`
+      type: intent.type,
+      data: null,
+      summary: `[simulated ${intent.type} result]`
     })
   }
-  const actionable = (intents as { type: string; confidence: number }[]).filter(
-    (i) => i.type !== 'RECORD_EXPENSE' && i.type !== 'UNKNOWN'
-  )
-  if (actionable.length > 0) {
-    engineResults.push({ type: actionable[0].type, data: null, summary: `[simulated ${actionable[0].type} result]` })
-  }
 
+  // Layer 3: ChatLLM
   if (engineResults.length > 0) {
     console.log('\n--- ChatLLM ---')
     try {

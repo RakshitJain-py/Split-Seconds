@@ -1,22 +1,19 @@
 import { ChatMessage } from './types'
-import { logMemory } from './debug/logger'
 
-const memory: Map<number, ChatMessage[]> = new Map()
+const memory = new Map<number, ChatMessage[]>()
+const MAX_MESSAGES = 10
 
-export function addMessage(groupId: number, message: ChatMessage): void {
-  const messages = memory.get(groupId) || []
-  messages.push(message)
-  if (messages.length > 11) {
-    messages.shift()
-  }
-  memory.set(groupId, messages)
-  logMemory(groupId, messages.slice(-3))
+export function addMessage(chatId: number, message: ChatMessage): void {
+  if (!memory.has(chatId)) memory.set(chatId, [])
+  const msgs = memory.get(chatId)!
+  msgs.push(message)
+  if (msgs.length > MAX_MESSAGES) msgs.shift()
 }
 
-export function getMessages(groupId: number): ChatMessage[] {
-  return memory.get(groupId) || []
+export function getMessages(chatId: number): ChatMessage[] {
+  return memory.get(chatId) || []
 }
 
-export function clearMemory(groupId: number): void {
-  memory.delete(groupId)
+export function clearMemory(chatId: number): void {
+  memory.delete(chatId)
 }

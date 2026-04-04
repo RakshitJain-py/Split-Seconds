@@ -1,40 +1,73 @@
-export type ParsedExpense = {
-  payer: number
-  amount: number
-  description: string
-  participants: number[] | null
-  tags: string[]
-}
-
 export type IntentType =
+  // Recording
   | 'RECORD_EXPENSE'
   | 'RECORD_TRANSFER'
+  // Corrections
+  | 'CORRECT_LAST'
+  | 'CORRECT_BY_DESCRIPTION'
+  // Balance queries
   | 'GROUP_BALANCES'
   | 'USER_BALANCE'
   | 'PAIR_BALANCE'
   | 'SETTLEMENT_PLAN'
+  // Contribution queries
   | 'USER_CONTRIBUTION'
   | 'CONTRIBUTION_RANKING'
+  // Category queries
   | 'CATEGORY_TOTAL'
   | 'CATEGORY_PAYER'
+  // Time queries
   | 'TIME_FILTERED_SPEND'
   | 'TIME_FILTERED_PAYER'
+  // Settlement trigger
   | 'TRIGGER_SETTLEMENT'
-  | 'CORRECT_LAST'
-  | 'CORRECT_BY_DESCRIPTION'
+  // Unknown / unrelated
   | 'UNKNOWN'
-
-export type TimeFilter = 'today' | 'yesterday' | 'this_week' | 'custom'
-export type TemporalMode = 'past' | 'current' | 'settlement'
 
 export type Intent = {
   type: IntentType
-  actor?: string
-  counterparty?: string
-  category?: string
-  time_filter?: TimeFilter
-  temporal_mode?: TemporalMode
-  confidence: number
+  actor?: string           // display name string (not id)
+  counterparty?: string    // display name string (not id)
+  amount?: number          // for transfers, corrections with new value
+  category?: string        // tag name for category queries
+  time_filter?: 'today' | 'yesterday' | 'this_week' | 'day_before_yesterday' | 'custom' | null
+  temporal_mode?: 'past' | 'current' | 'settlement' | null
+  confidence: number       // 0.0 to 1.0
+}
+
+export type ParsedExpense = {
+  payer: number            // telegram_user_id
+  amount: number
+  description: string
+  participants: number[] | null   // null = all members
+  tags: string[]
+  is_transfer: false
+}
+
+export type ParsedTransfer = {
+  payer: number            // who paid out the money
+  receiver: number | null  // telegram_user_id if known, null if name-only
+  receiver_name: string    // display name of receiver always
+  amount: number
+  is_transfer: true
+}
+
+export type MemberInfo = {
+  telegram_user_id: number
+  display_name: string
+  telegram_username: string | null
+}
+
+export type Transaction = {
+  from: number             // telegram_user_id
+  to: number               // telegram_user_id
+  amount: number
+}
+
+export type EngineResult = {
+  type: IntentType | 'RECORD_EXPENSE' | 'RECORD_TRANSFER'
+  data: unknown
+  summary: string          // used by Chat LLM as structured input
 }
 
 export type ChatMessage = {
@@ -45,45 +78,31 @@ export type ChatMessage = {
   timestamp: number
 }
 
-export type Transaction = {
-  from: number
-  to: number
-  amount: number
-}
-
-export type BalanceMap = Map<number, number>
-
-export type EngineResult = {
-  type: string
-  data: unknown
-  summary: string
-}
-
-export type MemberInfo = {
-  telegram_user_id: number
-  display_name: string
-  telegram_username: string | null
-}
-
-export type HistoryFilter = {
-  time_filter?: TimeFilter
-  user_id?: number
-  category?: string
-  custom_start?: string
-  custom_end?: string
-}
-
 export type DBExpense = {
   id: string
   group_id: string
+  settlement_id: string | null
   payer_telegram_user_id: number
   payer_display_name: string | null
   amount: number
-  description: string
+  description: string | null
+  tags: string[] | null
   participants: number[] | null
-  tags: string[]
   telegram_message_id: number | null
-  expense_timestamp: string
+  expense_timestamp: string | null
   created_at: string
-  settlement_id: string | null
+}
+
+export type UserBalanceView = {
+  user_id: number
+  net_balance: number
+  owes_to: { user_id: number; amount: number }[]
+  owed_by: { user_id: number; amount: number }[]
+}
+
+export type CategoryStats = {
+  tag: string
+  total: number
+  count: number
+  payers: { user_id: number; amount: number }[]
 }

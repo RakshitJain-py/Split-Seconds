@@ -1,37 +1,39 @@
-import { BalanceMap, Transaction } from '../types'
-import { logEngine } from '../debug/logger'
+import { Transaction } from '../types'
 
-export function computeMinimalSettlements(balanceMap: BalanceMap): Transaction[] {
-  const creditors: [number, number][] = []
-  const debtors: [number, number][] = []
+export function computeMinimalSettlements(
+  balances: Map<number, number>
+): Transaction[] {
+  const creditors: { id: number; amount: number }[] = []
+  const debtors: { id: number; amount: number }[] = []
 
-  for (const [userId, balance] of balanceMap) {
-    if (balance > 0.01) creditors.push([userId, balance])
-    else if (balance < -0.01) debtors.push([userId, balance])
+  for (const [uid, bal] of balances) {
+    if (bal > 0.01) creditors.push({ id: uid, amount: bal })
+    else if (bal < -0.01) debtors.push({ id: uid, amount: Math.abs(bal) })
   }
 
-  creditors.sort((a, b) => b[1] - a[1])
-  debtors.sort((a, b) => a[1] - b[1])
-  logEngine('balance_map', Object.fromEntries(balanceMap))
+  creditors.sort((a, b) => b.amount - a.amount)
+  debtors.sort((a, b) => b.amount - a.amount)
 
   const transactions: Transaction[] = []
-  let i = 0, j = 0
+  let ci = 0, di = 0
 
-  while (i < creditors.length && j < debtors.length) {
-    const credit = creditors[i][1]
-    const debt = -debtors[j][1]
-    const amount = Math.min(credit, debt)
+  while (ci < creditors.length && di < debtors.length) {
+    const credit = creditors[ci]
+    const debt = debtors[di]
+    const transfer = Math.min(credit.amount, debt.amount)
+
     transactions.push({
-      from: debtors[j][0],
-      to: creditors[i][0],
-      amount: Math.round(amount * 100) / 100
+      from: debt.id,
+      to: credit.id,
+      amount: Math.round(transfer * 100) / 100
     })
-    creditors[i][1] -= amount
-    debtors[j][1] += amount
-    if (creditors[i][1] < 0.01) i++
-    if (debtors[j][1] > -0.01) j++
+
+    credit.amount -= transfer
+    debt.amount -= transfer
+
+    if (credit.amount < 0.01) ci++
+    if (debt.amount < 0.01) di++
   }
 
-  logEngine('settlement_transactions', transactions)
   return transactions
 }

@@ -1,61 +1,65 @@
 import Groq from 'groq-sdk'
-import { ChatMessage, EngineResult, MemberInfo } from './types'
+import { EngineResult, MemberInfo, ChatMessage } from './types'
+import { logAI } from './debug/logger'
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY_CHAT })
 
-const SYSTEM_PROMPT = `You are a friendly Indian bill-splitting assistant in a Telegram group.
+const SYSTEM_PROMPT = `You are SplitSeconds, a friendly expense-splitting assistant in a Telegram group.
 
-Rules:
-- Respond naturally in English. Keep it casual and friendly.
-- You will receive structured data from the system. Use ONLY those numbers.
-- NEVER modify, calculate, or invent numbers.
-- NEVER generate amounts not present in the data.
-- Use member names from the data provided.
-- If confused, say: "wait, I didn't get that — say again?"
-- Do NOT produce robotic help menus.
-- Keep responses concise — this is Telegram, not an essay.
-- Use Rs. for currency amounts.
-- If settlement triggered, summarize the transactions clearly.
-- If no data available, say so naturally.`
+You receive structured data from financial engines and must format it as a natural reply.
+
+RULES:
+- Keep replies short and natural. This is a chat, not a report.
+- Never change any number. Use exactly what you are given.
+- Always use Rs. for amounts (not ₹ symbol, not USD, not rupees).
+- Do not add disclaimers, explanations of how you work, or meta-commentary.
+- Do not say "I calculated" or "according to my records" — just give the info.
+- If recording an expense or transfer: one short line confirming it. Example: "Got it, Rs.500 for chai logged."
+- If showing balances: list clearly, one person per line.
+- If showing settlement plan: list transactions clearly.
+- If a correction was made: confirm what was changed/removed.
+- If an error occurred (member not found, etc.): explain briefly and naturally.
+- English only for MVP. No Hinglish required.
+- Sound human, not robotic. "Got it" over "Confirmed". "All even!" over "Balance is zero."`
 
 export async function generateReply(
-  userMessage: string,
+  originalMessage: string,
   senderName: string,
-  engineResults: EngineResult[],
-  conversationHistory: ChatMessage[],
+  results: EngineResult[],
+  history: ChatMessage[],
   members: MemberInfo[],
   replyContext?: string
 ): Promise<string> {
-  const memberMap = members.map(m => `${m.display_name} (ID: ${m.telegram_user_id})`).join(', ')
+  const summaries = results.map(r => r.summary).filter(Boolean).join('\n\n')
 
-  const historyMessages = conversationHistory.slice(-10).map(msg => ({
-    role: msg.role as 'user' | 'assistant',
-    content: msg.text
-  }))
+  const recentHistory = history.slice(-6).map(m =>
+    m.role === 'user'
+      ? `User: ${m.text}`
+      : `Bot: ${m.text}`
+  ).join('\n')
 
-  const dataContext = engineResults.length > 0
-    ? `\n\nSystem data (use ONLY these numbers):\n${engineResults.map(r => r.summary).join('\n')}`
-    : ''
-
-  const replyCtx = replyContext ? `\n\nUser is replying to: "${replyContext}"` : ''
-
-  const messages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [
-    { role: 'system', content: SYSTEM_PROMPT + `\n\nGroup members: ${memberMap}` },
-    ...historyMessages,
-    { role: 'user', content: `${senderName}: "${userMessage}"${replyCtx}${dataContext}` }
-  ]
+  let userContent = `Recent chat:\n${recentHistory}\n\nCurrent message: "${originalMessage}" (from ${senderName})`
+  if (replyContext) userContent += `\nReplied to: "${replyContext}"`
+  userContent += `\n\nEngine output:\n${summaries}`
 
   try {
+    logAI('chatLLM_input', { context_length: history.length, summaries })
+
     const res = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
-      messages,
-      temperature: 0.6,
-      max_tokens: 500
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userContent }
+      ],
+      temperature: 0.3,
+      max_tokens: 300
     })
-    const reply = res.choices[0]?.message?.content?.trim() || "wait, I didn't get that — say again?"
+
+    const reply = res.choices[0]?.message?.content?.trim() || 'Something went wrong, try again.'
+    logAI('chatLLM_output', reply)
     return reply
   } catch (err) {
     console.error('[chatLLM] GROQ call failed:', err)
-    return "something went wrong on my end, try again in a sec"
+    return 'Had trouble responding, try again in a moment.'
   }
 }

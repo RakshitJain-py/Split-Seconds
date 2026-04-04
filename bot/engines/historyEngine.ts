@@ -1,57 +1,68 @@
 import { SupabaseClient } from '@supabase/supabase-js'
-import { DBExpense, HistoryFilter } from '../types'
+import { DBExpense } from '../types'
 
-function getTimeRange(filter: string): { start: string; end: string } {
+type HistoryFilter = {
+  time_filter?: string | null
+  category?: string | null
+  user_id?: number
+}
+
+function getTimeRange(filter: string): { from: string; to: string } {
   const now = new Date()
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
 
   switch (filter) {
     case 'today':
       return {
-        start: today.toISOString(),
-        end: new Date(today.getTime() + 86400000).toISOString()
+        from: today.toISOString(),
+        to: new Date(today.getTime() + 86400000).toISOString()
       }
     case 'yesterday': {
-      const yesterday = new Date(today.getTime() - 86400000)
-      return { start: yesterday.toISOString(), end: today.toISOString() }
+      const yest = new Date(today.getTime() - 86400000)
+      return { from: yest.toISOString(), to: today.toISOString() }
+    }
+    case 'day_before_yesterday': {
+      const dbY = new Date(today.getTime() - 172800000)
+      const yest = new Date(today.getTime() - 86400000)
+      return { from: dbY.toISOString(), to: yest.toISOString() }
     }
     case 'this_week': {
-      const day = today.getDay()
-      const monday = new Date(today.getTime() - (day === 0 ? 6 : day - 1) * 86400000)
-      return { start: monday.toISOString(), end: new Date(now.getTime() + 86400000).toISOString() }
+      const weekStart = new Date(today.getTime() - today.getDay() * 86400000)
+      return { from: weekStart.toISOString(), to: new Date(today.getTime() + 86400000).toISOString() }
     }
     default:
-      return { start: new Date(0).toISOString(), end: new Date(now.getTime() + 86400000).toISOString() }
+      return {
+        from: new Date(0).toISOString(),
+        to: new Date().toISOString()
+      }
   }
 }
 
 export async function queryHistory(
   db: SupabaseClient,
-  group_id: string,
+  groupId: string,
   filter: HistoryFilter
 ): Promise<DBExpense[]> {
   let query = db
     .from('expenses')
     .select('*')
-    .eq('group_id', group_id)
+    .eq('group_id', groupId)
     .is('settlement_id', null)
     .order('expense_timestamp', { ascending: false })
 
-  if (filter.time_filter) {
-    if (filter.time_filter === 'custom' && filter.custom_start && filter.custom_end) {
-      query = query.gte('expense_timestamp', filter.custom_start).lte('expense_timestamp', filter.custom_end)
-    } else {
-      const range = getTimeRange(filter.time_filter)
-      query = query.gte('expense_timestamp', range.start).lte('expense_timestamp', range.end)
-    }
+  if (filter.time_filter && filter.time_filter !== 'custom') {
+    const range = getTimeRange(filter.time_filter)
+    query = query
+      .gte('expense_timestamp', range.from)
+      .lte('expense_timestamp', range.to)
+  }
+
+  if (filter.category) {
+    query = query.contains('tags', [filter.category.toLowerCase()])
   }
 
   if (filter.user_id) {
     query = query.eq('payer_telegram_user_id', filter.user_id)
-  }
-
-  if (filter.category) {
-    query = query.contains('tags', [filter.category])
   }
 
   const { data } = await query
