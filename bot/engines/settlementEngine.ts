@@ -1,3 +1,8 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// SplitSeconds V2 — Settlement Engine
+// Greedy creditor-debtor matching. Pure function, no DB calls.
+// ─────────────────────────────────────────────────────────────────────────────
+
 import { Transaction } from '../types'
 
 export function computeMinimalSettlements(

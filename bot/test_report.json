@@ -1,0 +1,98 @@
+{
+  "botReplies": {
+    "bolt paid 500 for chai": "Expense logged, Aman paid Rs.500 for chai.",
+    "bolt raj paid 800 for petrol": "Expense logged: Raj paid Rs.800 for petrol.",
+    "bolt who owes whom": "Everyone's even! Aman's balance is Rs. 0. No one owes anyone.",
+    "bolt raj's balance": "Raj's balance is Rs.150. He's owed Rs.150 by Aman.",
+    "bolt total spent": "Guys, we've spent Rs. 1300 so far.",
+    "bolt undo": "Aman, Rs.800 for petrol was removed from raj's account.",
+    "bolt settle group": "Settled! 🎉\nRaj paid Aman Rs.250.\nFresh start!"
+  },
+  "expenses": [
+    {
+      "id": "1c52f3a9-2a0b-4a2d-ada0-ecc55ba24bc6",
+      "group_id": "7e6c8333-eb2a-4ebd-b4d4-07d536f2b5ba",
+      "settlement_id": "aeb3ae33-21ce-43b9-9f23-5a805eb98350",
+      "payer_telegram_user_id": 111,
+      "payer_display_name": "Aman",
+      "amount": 500,
+      "description": "chai",
+      "tags": [],
+      "participants": null,
+      "telegram_message_id": 1002,
+      "expense_timestamp": "2026-04-05T22:21:21+00:00",
+      "created_at": "2026-04-05T22:21:23.536986+00:00"
+    },
+    {
+      "id": "5e5abf7f-9804-44f4-b769-d7ba028cf227",
+      "group_id": "7e6c8333-eb2a-4ebd-b4d4-07d536f2b5ba",
+      "settlement_id": null,
+      "payer_telegram_user_id": 111,
+      "payer_display_name": "Aman",
+      "amount": 500,
+      "description": "chai",
+      "tags": [],
+      "participants": null,
+      "telegram_message_id": 1010,
+      "expense_timestamp": "2026-04-05T22:21:45+00:00",
+      "created_at": "2026-04-05T22:21:47.687191+00:00"
+    }
+  ],
+  "members": [
+    {
+      "id": "03a4b843-c9fb-4507-ada0-ee5cd821e2f2",
+      "group_id": "7e6c8333-eb2a-4ebd-b4d4-07d536f2b5ba",
+      "telegram_user_id": -193504450,
+      "telegram_username": null,
+      "display_name": "raj",
+      "alias_history": null,
+      "created_at": "2026-04-05T20:54:42.81578+00:00"
+    },
+    {
+      "id": "2f2bc7cb-2afb-462a-8729-28a1c96d480b",
+      "group_id": "7e6c8333-eb2a-4ebd-b4d4-07d536f2b5ba",
+      "telegram_user_id": 111,
+      "telegram_username": "aman_dev",
+      "display_name": "Aman",
+      "alias_history": null,
+      "created_at": "2026-04-05T20:54:38.684632+00:00"
+    }
+  ],
+  "settlements": [
+    {
+      "id": "aeb3ae33-21ce-43b9-9f23-5a805eb98350",
+      "group_id": "7e6c8333-eb2a-4ebd-b4d4-07d536f2b5ba",
+      "total_amount": 500,
+      "balances_snapshot": {
+        "111": 250,
+        "-193504450": -250
+      },
+      "transactions_snapshot": [
+        {
+          "to": 111,
+          "from": -193504450,
+          "amount": 250
+        }
+      ],
+      "note": null,
+      "created_at": "2026-04-05T22:21:41.291537+00:00"
+    }
+  ],
+  "groupState": {
+    "group_state": {
+      "last_action": {
+        "type": "log_expense",
+        "summary": "Aman logged chai Rs.500",
+        "timestamp": "2026-04-05T22:21:46.484Z",
+        "expense_id": "5e5abf7f-9804-44f4-b769-d7ba028cf227"
+      },
+      "name_aliases": {},
+      "semantic_summary": null,
+      "last_settlement_at": "2026-04-05T22:21:40.185Z",
+      "member_contributions": {
+        "Aman": 500
+      },
+      "pending_confirmation": null
+    }
+  }
+}

@@ -1,12 +1,35 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Temporary Version Step Down
-// Simplified dispatcher — single LLM for action detection, code for math
+// SplitSeconds V2 — Full Pipeline Dispatcher
+// Orchestrates all 5 layers: Gate → Classifier → Executor → Briefer → Reply
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createClient } from '@supabase/supabase-js'
-import { callBolt, BoltResponse } from './boltLLM'
 import { addMessage, getMessages } from './chatMemory'
-import { MemberInfo, DBExpense } from './types'
+import { MemberInfo, FunctionCall, ExecutorResult, GroupState } from './types'
+import { loadGroupState, saveGroupState, updateContributions } from './groupState'
+import { evaluateGate } from './gate'
+import { classify } from './classifier'
+import { resolveNames, buildNameClarificationMessage } from './nameResolver'
+import { buildBriefing, buildSocialBriefing, buildErrorBriefing } from './briefer'
+import { generateReply } from './replyGenerator'
+import {
+  debugNoGroup, debugGroupState, debugHotMemory, debugGate,
+  debugError, debugPendingConfirmation,
+  debugNameResolution, debugEngineCall, debugEngineResult, debugDuplicate,
+  debugBriefing, debugReplyStart, debugReplyResult,
+  debugStateSave, debugDispatchComplete,
+} from './debug'
+
+// Engines
+import { executeGroupBalances, executeUserBalance, executePairBalance } from './engines/balanceEngine'
+import {
+  logExpense, logTransfer,
+  correctDeleteLast, correctDeleteSpecific, correctDeleteAllMatching,
+  correctUpdateAmount, correctUpdatePayer, correctUpdateParticipants,
+  executeSettlement, querySettlementHistory
+} from './engines/writeEngine'
+import { queryContribution, queryTotalSpent } from './engines/contribEngine'
+import { queryCategory, queryTime, queryExpenseList } from './engines/filterEngine'
 
 export const db = createClient(
   process.env.SUPABASE_URL!,
@@ -49,356 +72,147 @@ export async function upsertMember(
   )
 }
 
-function nameToProvisionalId(name: string): number {
-  let hash = 5381
-  for (let i = 0; i < name.length; i++) {
-    hash = ((hash << 5) + hash) + name.charCodeAt(i)
-    hash = hash & hash
-  }
-  return -(Math.abs(hash) || 1)
-}
+// ─── Execute a single FunctionCall via the correct engine ───────────────────
 
-async function upsertProvisionalMember(groupId: string, name: string): Promise<void> {
-  const normalized = name.trim().toLowerCase()
-
-  const { data } = await db
-    .from('members')
-    .select('id')
-    .eq('group_id', groupId)
-    .ilike('display_name', normalized)
-    .limit(1)
-
-  if (data && data.length > 0) return
-
-  const provisionalId = nameToProvisionalId(normalized)
-
-  await db.from('members').upsert(
-    {
-      group_id: groupId,
-      telegram_user_id: provisionalId,
-      display_name: name.trim(),
-      telegram_username: null
-    },
-    { onConflict: 'group_id,telegram_user_id' }
-  )
-}
-
-function resolveMemberId(name: string, members: MemberInfo[]): number | undefined {
-  if (!name) return undefined
-  const lower = name.toLowerCase()
-  const exact = members.find(m => m.display_name.toLowerCase() === lower)
-  if (exact) return exact.telegram_user_id
-  const partial = members.find(m =>
-    m.display_name.toLowerCase().includes(lower) ||
-    lower.includes(m.display_name.toLowerCase())
-  )
-  return partial?.telegram_user_id
-}
-
-function memberName(userId: number, members: MemberInfo[]): string {
-  const found = members.find(m => m.telegram_user_id === userId)
-  return found?.display_name || `User ${userId}`
-}
-
-async function getUnsettledExpenses(groupId: string): Promise<DBExpense[]> {
-  const { data } = await db
-    .from('expenses')
-    .select('*')
-    .eq('group_id', groupId)
-    .is('settlement_id', null)
-    .order('created_at', { ascending: false })
-    .limit(50)
-  return (data as DBExpense[]) || []
-}
-
-// ─── Deterministic Balance Computation ───────────────────────────────────────
-// LLMs can't do math. This is the ONLY place balances are calculated.
-
-function computeBalances(expenses: DBExpense[], allMemberIds: number[]): Map<number, number> {
-  const balances = new Map<number, number>()
-
-  // Initialize all members to 0
-  for (const uid of allMemberIds) {
-    balances.set(uid, 0)
-  }
-
-  for (const exp of expenses) {
-    const payerId = exp.payer_telegram_user_id
-    const amount = Number(exp.amount)
-
-    // Who shares this expense?
-    let participantIds: number[]
-    if (exp.participants && exp.participants.length > 0) {
-      participantIds = exp.participants
-    } else {
-      // Empty/null = split among ALL members
-      participantIds = allMemberIds
-    }
-
-    // Ensure payer exists in map
-    if (!balances.has(payerId)) balances.set(payerId, 0)
-
-    // Payer gets credited (they paid out money)
-    balances.set(payerId, (balances.get(payerId) || 0) + amount)
-
-    // Each participant gets debited their share
-    const share = amount / participantIds.length
-    for (const pid of participantIds) {
-      if (!balances.has(pid)) balances.set(pid, 0)
-      balances.set(pid, (balances.get(pid) || 0) - share)
-    }
-  }
-
-  // Round
-  for (const [uid, bal] of balances) {
-    balances.set(uid, Math.round(bal * 100) / 100)
-  }
-
-  return balances
-}
-
-type Settlement = { from: number; to: number; amount: number }
-
-function computeSettlements(balances: Map<number, number>): Settlement[] {
-  const creditors: { id: number; amount: number }[] = []
-  const debtors: { id: number; amount: number }[] = []
-
-  for (const [uid, bal] of balances) {
-    if (bal > 0.01) creditors.push({ id: uid, amount: bal })
-    else if (bal < -0.01) debtors.push({ id: uid, amount: Math.abs(bal) })
-  }
-
-  creditors.sort((a, b) => b.amount - a.amount)
-  debtors.sort((a, b) => b.amount - a.amount)
-
-  const txns: Settlement[] = []
-  let ci = 0, di = 0
-
-  while (ci < creditors.length && di < debtors.length) {
-    const credit = creditors[ci]
-    const debt = debtors[di]
-    const transfer = Math.min(credit.amount, debt.amount)
-
-    txns.push({
-      from: debt.id,
-      to: credit.id,
-      amount: Math.round(transfer * 100) / 100
-    })
-
-    credit.amount -= transfer
-    debt.amount -= transfer
-
-    if (credit.amount < 0.01) ci++
-    if (debt.amount < 0.01) di++
-  }
-
-  return txns
-}
-
-// Format balances into a human reply (code, not LLM)
-function formatBalanceReply(balances: Map<number, number>, members: MemberInfo[]): string {
-  const lines: string[] = []
-  let totalSpent = 0
-
-  // Calculate total from expenses perspective
-  for (const [uid, bal] of balances) {
-    if (uid < 0) continue // skip provisional members with no real activity
-    if (bal > 0.01) lines.push(`${memberName(uid, members)}: is owed Rs.${Math.round(bal)}`)
-    else if (bal < -0.01) lines.push(`${memberName(uid, members)}: owes Rs.${Math.round(Math.abs(bal))}`)
-    else lines.push(`${memberName(uid, members)}: all settled ✓`)
-  }
-
-  if (lines.length === 0) return "No expenses recorded yet."
-
-  // Compute who should pay whom
-  const settlements = computeSettlements(balances)
-  if (settlements.length > 0) {
-    lines.push('')
-    lines.push('To settle up:')
-    for (const s of settlements) {
-      lines.push(`  ${memberName(s.from, members)} → ${memberName(s.to, members)}: Rs.${Math.round(s.amount)}`)
-    }
-  } else {
-    lines.push('\nEveryone is even! 🎉')
-  }
-
-  return lines.join('\n')
-}
-
-function formatTotalReply(expenses: DBExpense[], members: MemberInfo[]): string {
-  const nonTransfers = expenses.filter(e => !e.tags || !e.tags.includes('transfer'))
-  if (nonTransfers.length === 0) return "No expenses recorded yet."
-  const total = nonTransfers.reduce((s, e) => s + Number(e.amount), 0)
-  return `Total spent: Rs.${Math.round(total)} across ${nonTransfers.length} expenses.`
-}
-
-// ─── Action Handlers ─────────────────────────────────────────────────────────
-
-async function handleExpense(
-  bolt: BoltResponse,
+async function executeFunction(
+  fnCall: FunctionCall,
   groupId: string,
+  members: MemberInfo[],
   senderId: number,
   senderName: string,
-  members: MemberInfo[],
+  state: GroupState,
   messageId: number,
-  messageDate: number
-): Promise<void> {
-  const exp = bolt.expense
-  if (!exp || !exp.amount || exp.amount <= 0) return
+  messageDate: number,
+  replyToIsBot: boolean
+): Promise<ExecutorResult> {
+  const p = fnCall.parameters as Record<string, unknown>
 
-  const payerName = exp.payer_name || senderName
-  await upsertProvisionalMember(groupId, payerName)
+  switch (fnCall.name) {
 
-  if (exp.participants && exp.participants.length > 0) {
-    for (const name of exp.participants) {
-      await upsertProvisionalMember(groupId, name)
+    // ── RECORD ──────────────────────────────────────────────────────────────
+    case 'log_expense':
+      return logExpense(db, groupId, senderId, senderName, {
+        payer_name: (p.payer_name as string) || senderName,
+        amount: p.amount as number,
+        description: p.description as string,
+        participant_names: p.participant_names as string[] | undefined,
+        tags: p.tags as string[] | undefined
+      }, messageId, messageDate)
+
+    case 'log_transfer':
+      return logTransfer(db, groupId, senderId, senderName, {
+        from_name: p.from_name as string,
+        to_name: p.to_name as string,
+        amount: p.amount as number
+      })
+
+    // ── QUERY ────────────────────────────────────────────────────────────────
+    case 'query_balance_group':
+      return executeGroupBalances(db, groupId, members)
+
+    case 'query_balance_user': {
+      const userName = (p.user_name as string) || senderName
+      const targetMember = members.find(m =>
+        m.display_name.toLowerCase() === userName.toLowerCase()
+      )
+      const targetId = targetMember?.telegram_user_id || senderId
+      return executeUserBalance(db, groupId, targetId, members)
     }
+
+    case 'query_balance_pair': {
+      const mA = members.find(m => m.display_name.toLowerCase() === (p.user_a as string)?.toLowerCase())
+      const mB = members.find(m => m.display_name.toLowerCase() === (p.user_b as string)?.toLowerCase())
+      if (!mA || !mB) {
+        return { success: false, data: null, error: `Couldn't find both members.`, state_updates: {} }
+      }
+      return executePairBalance(db, groupId, mA.telegram_user_id, mB.telegram_user_id, members)
+    }
+
+    case 'query_contribution': {
+      const userName = p.user_name as string | null
+      const scope = (p.scope as 'single' | 'ranking') || 'ranking'
+      let userId: number | null = null
+      if (userName) {
+        const m = members.find(m => m.display_name.toLowerCase() === userName.toLowerCase())
+        userId = m?.telegram_user_id || senderId
+      }
+      return queryContribution(db, groupId, userId, scope, members)
+    }
+
+    case 'query_total_spent':
+      return queryTotalSpent(db, groupId, members)
+
+    case 'query_category':
+      return queryCategory(db, groupId, p.tag as string, p.time_filter as string, members)
+
+    case 'query_time': {
+      const userName = p.user_name as string | null
+      let userId: number | null = null
+      if (userName) {
+        const m = members.find(m => m.display_name.toLowerCase() === userName.toLowerCase())
+        userId = m?.telegram_user_id || null
+      }
+      return queryTime(db, groupId, p.time_filter as string, userId, members)
+    }
+
+    case 'query_expense_list': {
+      const userName = p.user_name as string | null
+      let userId: number | null = null
+      if (userName) {
+        const m = members.find(m => m.display_name.toLowerCase() === userName.toLowerCase())
+        userId = m?.telegram_user_id || null
+      }
+      return queryExpenseList(db, groupId, (p.limit as number) || 10, userId, members)
+    }
+
+    case 'query_settlement_history':
+      return querySettlementHistory(db, groupId, members)
+
+    // ── CORRECT ──────────────────────────────────────────────────────────────
+    case 'correct_delete_last':
+      if (!replyToIsBot) {
+        return { success: false, data: null, error: 'Please reply directly to the specific bot receipt you want to undo, or name the expense explicitly (e.g., "undo petrol").', state_updates: {} }
+      }
+      return correctDeleteLast(db, groupId, state)
+
+    case 'correct_delete_specific':
+      return correctDeleteSpecific(db, groupId, p.description_hint as string, state)
+
+    case 'correct_delete_all_matching':
+      return correctDeleteAllMatching(db, groupId, p.description_hint as string, state)
+
+    case 'correct_update_amount':
+      return correctUpdateAmount(db, groupId, p.new_amount as number, p.description_hint as string | null)
+
+    case 'correct_update_payer':
+      return correctUpdatePayer(db, groupId, p.new_payer_name as string, p.description_hint as string | null)
+
+    case 'correct_update_participants':
+      return correctUpdateParticipants(db, groupId, p.participant_names as string[], p.description_hint as string | null)
+
+    // ── CONTROL ──────────────────────────────────────────────────────────────
+    case 'trigger_settlement':
+      return executeSettlement(db, groupId, members)
+
+    case 'change_name': {
+      const newName = p.new_name as string
+      await db.from('groups').update({ bot_alias: newName }).eq('id', groupId)
+      return {
+        success: true,
+        data: { new_name: newName },
+        state_updates: {
+          last_action: {
+            type: 'control',
+            summary: `Bot name changed to "${newName}"`,
+            timestamp: new Date().toISOString()
+          }
+        }
+      }
+    }
+
+    default:
+      return { success: false, data: null, error: `Unknown function: ${fnCall.name}`, state_updates: {} }
   }
-
-  const updatedMembers = await getMembers(groupId)
-  const payerId = resolveMemberId(payerName, updatedMembers) || senderId
-
-  let participantIds: number[] | null = null
-  if (exp.participants && exp.participants.length > 0) {
-    participantIds = exp.participants
-      .map(name => resolveMemberId(name, updatedMembers))
-      .filter((id): id is number => id !== undefined)
-  }
-
-  const { error } = await db.from('expenses').insert({
-    group_id: groupId,
-    payer_telegram_user_id: payerId,
-    payer_display_name: memberName(payerId, updatedMembers),
-    amount: exp.amount,
-    description: exp.description || '',
-    participants: participantIds,
-    tags: exp.tags || [],
-    expense_timestamp: new Date(messageDate * 1000).toISOString(),
-    telegram_message_id: messageId
-  })
-
-  if (error) {
-    console.error('[dispatch] Expense insert error:', error)
-  } else {
-    console.log('[dispatch] ✓ Expense logged:', exp.amount, exp.description)
-  }
-}
-
-async function handleTransfer(
-  bolt: BoltResponse,
-  groupId: string,
-  senderId: number,
-  senderName: string,
-  members: MemberInfo[]
-): Promise<void> {
-  const tx = bolt.transfer
-  if (!tx || !tx.amount || tx.amount <= 0) return
-
-  const fromName = tx.from || senderName
-  const toName = tx.to || senderName
-
-  await upsertProvisionalMember(groupId, fromName)
-  await upsertProvisionalMember(groupId, toName)
-
-  const updatedMembers = await getMembers(groupId)
-  const fromId = resolveMemberId(fromName, updatedMembers) || senderId
-  const toId = resolveMemberId(toName, updatedMembers)
-
-  if (!toId) {
-    console.error('[dispatch] Could not resolve transfer recipient:', toName)
-    return
-  }
-
-  const { error } = await db.from('expenses').insert({
-    group_id: groupId,
-    payer_telegram_user_id: fromId,
-    payer_display_name: memberName(fromId, updatedMembers),
-    amount: tx.amount,
-    description: `transfer to ${memberName(toId, updatedMembers)}`,
-    participants: [toId],
-    tags: ['transfer'],
-    expense_timestamp: new Date().toISOString()
-  })
-
-  if (error) {
-    console.error('[dispatch] Transfer insert error:', error)
-  } else {
-    console.log('[dispatch] ✓ Transfer logged:', fromName, '→', toName, tx.amount)
-  }
-}
-
-async function handleSettle(
-  groupId: string,
-  members: MemberInfo[],
-  expenses: DBExpense[]
-): Promise<string> {
-
-  if (expenses.length === 0) return 'No unsettled expenses to settle.'
-
-  const allMemberIds = members.map(m => m.telegram_user_id)
-  const balances = computeBalances(expenses, allMemberIds)
-  const txns = computeSettlements(balances)
-
-  const totalAmount = expenses.reduce((s, e) => s + Number(e.amount), 0)
-
-  const balancesSnapshot: Record<string, number> = {}
-  for (const [uid, bal] of balances) balancesSnapshot[String(uid)] = bal
-
-  const { data: settlement } = await db
-    .from('settlements')
-    .insert({
-      group_id: groupId,
-      total_amount: totalAmount,
-      balances_snapshot: balancesSnapshot,
-      transactions_snapshot: txns
-    })
-    .select('id')
-    .single()
-
-  if (settlement) {
-    const ids = expenses.map(e => e.id)
-    await db.from('expenses').update({ settlement_id: settlement.id }).in('id', ids)
-    console.log('[dispatch] ✓ Settlement created:', settlement.id)
-  }
-
-  if (txns.length === 0) {
-    return `Settlement done! Total: Rs.${Math.round(totalAmount)}. Everyone was even! 🎉`
-  }
-
-  const lines = [`Settlement recorded. Total: Rs.${Math.round(totalAmount)}.`, '']
-  for (const t of txns) {
-    lines.push(`${memberName(t.from, members)} → ${memberName(t.to, members)}: Rs.${Math.round(t.amount)}`)
-  }
-  lines.push('', 'All expenses marked settled. Fresh start! ✨')
-  return lines.join('\n')
-}
-
-async function handleCorrection(bolt: BoltResponse, groupId: string, members: MemberInfo[]): Promise<string> {
-  const corr = bolt.correction
-  if (!corr) return 'Could not understand what to correct.'
-
-  const { data: last } = await db
-    .from('expenses')
-    .select('*')
-    .eq('group_id', groupId)
-    .is('settlement_id', null)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .single()
-
-  if (!last) return 'No recent expense found to correct.'
-
-  if (corr.type === 'delete_last') {
-    await db.from('expenses').delete().eq('id', last.id)
-    console.log('[dispatch] ✓ Deleted last expense:', last.id)
-    return `Removed: Rs.${last.amount} "${last.description}" by ${last.payer_display_name || 'unknown'}.`
-  } else if (corr.type === 'update_amount' && corr.new_amount && corr.new_amount > 0) {
-    await db.from('expenses').update({ amount: corr.new_amount }).eq('id', last.id)
-    console.log('[dispatch] ✓ Updated expense:', last.id, '→', corr.new_amount)
-    return `Updated "${last.description}" from Rs.${last.amount} to Rs.${corr.new_amount}.`
-  }
-
-  return 'Could not process correction.'
 }
 
 // ─── Main Dispatch ───────────────────────────────────────────────────────────
@@ -411,20 +225,25 @@ export async function dispatch(
   senderUsername: string | undefined,
   messageId: number,
   messageDate: number,
-  replyText?: string
+  replyText?: string,
+  replyToIsBot?: boolean
 ): Promise<string | null> {
 
+  // 0. Load group + state
   const group = await getGroupByChat(chatId)
   if (!group) {
-    console.log('[dispatch] No group found for chat', chatId)
+    debugNoGroup(chatId)
+    debugDispatchComplete(null)
     return null
   }
 
-  // Upsert the sender
+  const state = await loadGroupState(db, group.id)
+  debugGroupState(state)
+
   await upsertMember(group.id, senderId, senderName, senderUsername)
   const members = await getMembers(group.id)
 
-  // Store message in memory
+  // Hot memory
   addMessage(chatId, {
     role: 'user',
     telegram_user_id: senderId,
@@ -432,72 +251,244 @@ export async function dispatch(
     message_id: messageId,
     timestamp: messageDate
   })
+  const hotMemory = getMessages(chatId)
+  debugHotMemory(chatId, hotMemory)
 
-  const history = getMessages(chatId)
+  // L1 — Gate
+  const botAlias = group.bot_alias || 'bolt'
+  const gate = evaluateGate(messageText, replyToIsBot || false, botAlias)
+  debugGate(gate, messageText, botAlias)
 
-  // Get current expenses for context
-  const expenses = await getUnsettledExpenses(group.id)
-
-  // Call the single LLM for action detection
-  console.log(`[dispatch] Calling Bolt for: "${messageText}" from ${senderName}`)
-  const bolt = await callBolt(messageText, senderName, history, members, expenses)
-  console.log('[dispatch] Bolt action:', bolt.action)
-
-  // ── Execute action and build reply ─────────────────────────────────────────
-  let reply: string
-
-  switch (bolt.action) {
-
-    case 'log_expense':
-      await handleExpense(bolt, group.id, senderId, senderName, members, messageId, messageDate)
-      reply = bolt.reply // LLM confirmation is fine for this
-      break
-
-    case 'transfer':
-      await handleTransfer(bolt, group.id, senderId, senderName, members)
-      reply = bolt.reply
-      break
-
-    case 'settle':
-      // Deterministic — code does the math and formats reply
-      reply = await handleSettle(group.id, members, expenses)
-      break
-
-    case 'correction':
-      // Deterministic — code does the action and formats reply
-      reply = await handleCorrection(bolt, group.id, members)
-      break
-
-    case 'query': {
-      // NEVER trust LLM math — compute balances deterministically
-      const allMemberIds = members.map(m => m.telegram_user_id)
-      const balances = computeBalances(expenses, allMemberIds)
-
-      // Detect query sub-type from bolt or message
-      const msg = messageText.toLowerCase()
-      if (msg.includes('total') || msg.includes('kitna hua') || msg.includes('total spent')) {
-        reply = formatTotalReply(expenses, members)
-      } else {
-        // Default: full balance view with settlement plan
-        reply = formatBalanceReply(balances, members)
-      }
-      break
-    }
-
-    case 'none':
-    default:
-      reply = bolt.reply
-      break
+  if (gate.decision === 'ignore') {
+    debugDispatchComplete(null)
+    return null
   }
 
-  // Store bot reply in memory
-  if (reply) {
-    addMessage(chatId, {
-      role: 'assistant',
-      text: reply,
-      timestamp: Math.floor(Date.now() / 1000)
+  // ── Passive: memory only — NO classifier, NO DB write ────────────────────
+  // The group is casually discussing money. We note it in warm memory so the
+  // classifier has context if the user later explicitly asks the bot to log it.
+  // Nothing is written to the expenses table until a directed trigger fires.
+  if (gate.decision === 'passive') {
+    const passiveMention = `${senderName}: "${messageText}" (noted, not logged)`
+    const existingMentions: string[] = (state as Record<string, unknown>).passive_mentions as string[] || []
+    const updatedMentions = [...existingMentions.slice(-4), passiveMention] // keep last 5
+    await saveGroupState(db, group.id, { passive_mentions: updatedMentions } as Record<string, unknown>)
+    debugDispatchComplete(null)
+    return null
+  }
+
+  // L2 — Classify
+  let classification
+  try {
+    classification = await classify(gate.stripped_message, senderName, members, state, replyText)
+  } catch (err) {
+    debugError('Dispatcher — Classifier threw', err)
+    const briefing = buildErrorBriefing('Classifier failed', senderName, group.group_mode)
+    return generateReply(briefing)
+  }
+
+  // ── Handle pending confirmation (resolve yes/no to stored actions) ──────────
+  if (state.pending_confirmation && classification.status === 'social') {
+    const subtype = (classification as { status: 'social'; subtype: string }).subtype
+    if (subtype === 'confirmation_yes') {
+      debugPendingConfirmation(subtype, 'yes')
+      // Execute the stored pending actions
+      const pending = state.pending_confirmation
+      const results: ExecutorResult[] = []
+      for (const action of pending.parsed_actions) {
+        debugEngineCall(action.name, action.parameters as Record<string, unknown>)
+        const result = await executeFunction(action, group.id, members, senderId, senderName, state, messageId, messageDate, replyToIsBot || false)
+        debugEngineResult(action.name, result)
+        // Bug 1: ensure state_updates has pending_confirmation: null
+        if (result.success) {
+           result.state_updates.pending_confirmation = null
+        }
+        results.push(result)
+      }
+      const allGood = results.every(r => r.success)
+      const combined = allGood
+        ? results.map(r => { const d = r.data as Record<string, unknown>; return (d?.description as string) || '' }).filter(Boolean).join(', ')
+        : results.find(r => !r.success)?.error || 'Error'
+
+      const stateUpdate = results.find(r => Object.keys(r.state_updates).length > 0)?.state_updates || {}
+      await saveGroupState(db, group.id, { ...stateUpdate, pending_confirmation: null })
+
+      const briefing = buildSocialBriefing('confirmation_yes', allGood ? `Done! Logged: ${combined}` : combined, state, hotMemory, senderName, members, group.group_mode)
+      debugBriefing(briefing)
+      debugReplyStart()
+      const reply = await generateReply(briefing)
+      debugReplyResult(reply)
+      addMessage(chatId, { role: 'assistant', text: reply, timestamp: Math.floor(Date.now() / 1000) })
+      debugDispatchComplete(reply)
+      return reply
+    }
+
+    if (subtype === 'confirmation_no') {
+      debugPendingConfirmation(subtype, 'no')
+      await saveGroupState(db, group.id, { pending_confirmation: null })
+      const briefing = buildSocialBriefing('confirmation_no', 'Cancelled. Nothing was saved.', state, hotMemory, senderName, members, group.group_mode)
+      debugBriefing(briefing)
+      debugReplyStart()
+      const reply = await generateReply(briefing)
+      debugReplyResult(reply)
+      addMessage(chatId, { role: 'assistant', text: reply, timestamp: Math.floor(Date.now() / 1000) })
+      debugDispatchComplete(reply)
+      return reply
+    }
+  }
+
+  // ── Handle multi-action (ask confirmation before executing) ─────────────────
+  if (classification.status === 'multi') {
+    const confirmMsg = classification.confirmation_message
+    await saveGroupState(db, group.id, {
+      pending_confirmation: {
+        asked_by_bot: confirmMsg,
+        parsed_actions: classification.actions,
+        waiting_since: new Date().toISOString()
+      }
+    })
+    addMessage(chatId, { role: 'assistant', text: confirmMsg, timestamp: Math.floor(Date.now() / 1000) })
+    debugDispatchComplete(confirmMsg)
+    return confirmMsg
+  }
+
+  // ── Handle ambiguous (ask before doing anything) ────────────────────────────
+  if (classification.status === 'ambiguous') {
+    const question = classification.question
+    await saveGroupState(db, group.id, {
+      pending_confirmation: {
+        asked_by_bot: question,
+        parsed_actions: classification.options,
+        waiting_since: new Date().toISOString()
+      }
+    })
+    addMessage(chatId, { role: 'assistant', text: question, timestamp: Math.floor(Date.now() / 1000) })
+    debugDispatchComplete(question)
+    return question
+  }
+
+  // ── Handle social ────────────────────────────────────────────────────────────
+  if (classification.status === 'social') {
+    const replyHint = (classification as { status: 'social'; reply_hint: string }).reply_hint
+    const subtype = (classification as { status: 'social'; subtype: string }).subtype
+    const briefing = buildSocialBriefing(subtype, replyHint, state, hotMemory, senderName, members, group.group_mode)
+    debugBriefing(briefing)
+    debugReplyStart()
+    const reply = await generateReply(briefing)
+    debugReplyResult(reply)
+    addMessage(chatId, { role: 'assistant', text: reply, timestamp: Math.floor(Date.now() / 1000) })
+    debugDispatchComplete(reply)
+    return reply
+  }
+
+  // ── Handle ignore ────────────────────────────────────────────────────────────
+  if (classification.status === 'ignore') {
+    debugDispatchComplete(null)
+    return null
+  }
+
+  // ── L3 — Execute (single function call) ─────────────────────────────────────
+  if (classification.status !== 'single') return null
+
+  const fnCall: FunctionCall = classification.function
+
+  // Name resolution
+  const nameResolution = resolveNames(fnCall, members, state.name_aliases)
+  debugNameResolution(nameResolution, members)
+  if (nameResolution.has_ambiguous_names) {
+    const clarification = buildNameClarificationMessage(nameResolution.ambiguous_names)
+    await saveGroupState(db, group.id, {
+      pending_confirmation: {
+        asked_by_bot: clarification,
+        parsed_actions: [fnCall],
+        waiting_since: new Date().toISOString()
+      }
+    })
+    addMessage(chatId, { role: 'assistant', text: clarification, timestamp: Math.floor(Date.now() / 1000) })
+    debugDispatchComplete(clarification)
+    return clarification
+  }
+
+  // Save any new aliases discovered during resolution
+  if (Object.keys(nameResolution.new_aliases).length > 0) {
+    await saveGroupState(db, group.id, {
+      name_aliases: { ...state.name_aliases, ...nameResolution.new_aliases }
     })
   }
 
-  return reply || null
+  debugEngineCall(nameResolution.resolved_call.name, nameResolution.resolved_call.parameters as Record<string, unknown>)
+  const executorResult = await executeFunction(
+    nameResolution.resolved_call,
+    group.id,
+    members,
+    senderId,
+    senderName,
+    state,
+    messageId,
+    messageDate,
+    replyToIsBot || false
+  )
+  debugEngineResult(nameResolution.resolved_call.name, executorResult)
+
+  // Bug 1 Fix: Clear pending confirmation deadlock automatically upon any successful new command
+  if (executorResult.success) {
+    executorResult.state_updates.pending_confirmation = null
+  }
+
+  // ── Duplicate detected — ask user ───────────────────────────────────────────
+  if (!executorResult.success && executorResult.error?.startsWith('DUPLICATE:')) {
+    const [, amount, desc] = executorResult.error.split(':')
+    debugDuplicate(amount, desc)
+    const dupMsg = `Looks like I already recorded Rs.${amount} "${desc}" just now — log it again?`
+    await saveGroupState(db, group.id, {
+      pending_confirmation: {
+        asked_by_bot: dupMsg,
+        parsed_actions: [fnCall],
+        waiting_since: new Date().toISOString()
+      }
+    })
+    addMessage(chatId, { role: 'assistant', text: dupMsg, timestamp: Math.floor(Date.now() / 1000) })
+    debugDispatchComplete(dupMsg)
+    return dupMsg
+  }
+
+  // ── Update member contributions if expense logged ────────────────────────────
+  if (fnCall.name === 'log_expense' && executorResult.success) {
+    const p = fnCall.parameters as Record<string, unknown>
+    const payerName = (p.payer_name as string) || senderName
+    executorResult.state_updates.member_contributions = updateContributions(
+      state.member_contributions,
+      payerName,
+      p.amount as number
+    )
+  }
+
+  // L4 — Brief
+  const briefing = buildBriefing(
+    fnCall.name,
+    executorResult,
+    state,
+    hotMemory,
+    senderName,
+    members,
+    group.group_mode
+  )
+  debugBriefing(briefing)
+
+  // (Passive messages never reach here — they exit early above)
+
+  // L5 — Reply
+  debugReplyStart()
+  const reply = await generateReply(briefing)
+  debugReplyResult(reply)
+
+  // Save state
+  if (Object.keys(executorResult.state_updates).length > 0) {
+    debugStateSave(group.id, executorResult.state_updates as Record<string, unknown>)
+    await saveGroupState(db, group.id, executorResult.state_updates)
+  }
+
+  addMessage(chatId, { role: 'assistant', text: reply, timestamp: Math.floor(Date.now() / 1000) })
+  debugDispatchComplete(reply)
+  return reply
 }
